@@ -1,0 +1,18 @@
+[package]
+name = "zig-docs-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+rmcp = { version = "0.15.0", features = ["server", "transport-io"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.22"
+tar = "0.4"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
