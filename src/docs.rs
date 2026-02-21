@@ -48,6 +48,7 @@ const VOLATILE_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 struct VersionIndex {
     tantivy: Index,
     entries: Vec<DocEntry>,
+    sources: HashMap<String, String>,
     built_at: Instant,
 }
 
@@ -228,7 +229,7 @@ impl DocIndex {
                         source: doc
                             .map(|d| d.source.clone())
                             .unwrap_or_else(|| entry.source.clone()),
-                        summary: doc.map(|d| first_line(&d.body)).unwrap_or_default(),
+                        summary: doc.map(|d| summary_line(&d.body)).unwrap_or_default(),
                         child_count,
                     });
                 }
@@ -252,7 +253,7 @@ impl DocIndex {
                             children.push(ChildEntry {
                                 name: entry.title.clone(),
                                 source: entry.source.clone(),
-                                summary: first_line(&entry.body),
+                                summary: summary_line(&entry.body),
                                 child_count,
                             });
                         }
@@ -263,6 +264,38 @@ impl DocIndex {
 
         children.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(children)
+    }
+
+    pub async fn get_source(&self, path: &str, version: &str) -> Result<Option<(String, String)>> {
+        self.ensure_index(version).await?;
+
+        let indexes = self.indexes.lock().await;
+        let vi = indexes.get(version).context("Index not found")?;
+
+        // Exact file match — return whole module
+        if let Some(source) = vi.sources.get(path) {
+            return Ok(Some((path.to_string(), source.clone())));
+        }
+
+        // Strip components to find the containing module file, then try
+        // to extract just the requested declaration from it.
+        let mut module_path = path.to_string();
+        loop {
+            match module_path.rsplit_once('.') {
+                Some((parent, _)) if parent.contains('.') => {
+                    module_path = parent.to_string();
+                    if let Some(source) = vi.sources.get(&module_path) {
+                        let remainder = &path[module_path.len() + 1..];
+                        if let Some(decl_source) = extract_declaration(source, remainder) {
+                            return Ok(Some((path.to_string(), decl_source)));
+                        }
+                        // Couldn't isolate the declaration — return whole file
+                        return Ok(Some((module_path, source.clone())));
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
     }
 
     async fn ensure_index(&self, version: &str) -> Result<()> {
@@ -289,6 +322,7 @@ impl DocIndex {
             .build()?;
 
         let mut all_entries = Vec::new();
+        let mut stdlib_sources = HashMap::new();
 
         let (langref, stdlib, guides) = tokio::join!(
             self.fetch_and_parse_langref(&client, version),
@@ -304,9 +338,10 @@ impl DocIndex {
             Err(e) => tracing::warn!("Failed to fetch langref: {}", e),
         }
         match stdlib {
-            Ok(entries) => {
+            Ok((entries, sources)) => {
                 tracing::info!(count = entries.len(), "Parsed stdlib entries");
                 all_entries.extend(entries);
+                stdlib_sources = sources;
             }
             Err(e) => tracing::warn!("Failed to fetch stdlib: {}", e),
         }
@@ -341,6 +376,7 @@ impl DocIndex {
         Ok(VersionIndex {
             tantivy: index,
             entries: all_entries,
+            sources: stdlib_sources,
             built_at: Instant::now(),
         })
     }
@@ -359,7 +395,7 @@ impl DocIndex {
         &self,
         client: &reqwest::Client,
         version: &str,
-    ) -> Result<Vec<DocEntry>> {
+    ) -> Result<(Vec<DocEntry>, HashMap<String, String>)> {
         let tar_path = self.cache_dir.join(version).join("sources.tar");
         let tar_bytes = if tar_path.exists() && (is_release_version(version) || is_cache_fresh(&tar_path)) {
             tokio::fs::read(&tar_path).await?
@@ -434,13 +470,18 @@ fn field_text(doc: &TantivyDocument, field: schema::Field) -> String {
         .to_string()
 }
 
-fn first_line(text: &str) -> String {
-    let line = text.lines().next().unwrap_or("");
-    if line.len() > 150 {
-        format!("{}...", &line[..147])
-    } else {
-        line.to_string()
+fn summary_line(text: &str) -> String {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "Fields:" {
+            continue;
+        }
+        if trimmed.len() > 150 {
+            return format!("{}...", &trimmed[..147]);
+        }
+        return trimmed.to_string();
     }
+    String::new()
 }
 
 fn is_release_version(version: &str) -> bool {
@@ -539,9 +580,10 @@ fn parse_langref_html(html: &str, version: &str) -> Vec<DocEntry> {
 
 // --- Stdlib parsing ---
 
-fn parse_stdlib_tar(tar_bytes: &[u8], version: &str) -> Result<Vec<DocEntry>> {
+fn parse_stdlib_tar(tar_bytes: &[u8], version: &str) -> Result<(Vec<DocEntry>, HashMap<String, String>)> {
     let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
     let mut entries = Vec::new();
+    let mut sources = HashMap::new();
 
     for tar_entry in archive.entries()? {
         let mut tar_entry = tar_entry?;
@@ -565,10 +607,11 @@ fn parse_stdlib_tar(tar_bytes: &[u8], version: &str) -> Result<Vec<DocEntry>> {
             raw
         };
 
+        sources.insert(module_path.clone(), content.clone());
         entries.extend(parse_zig_doc_comments(&content, &module_path, version));
     }
 
-    Ok(entries)
+    Ok((entries, sources))
 }
 
 fn parse_zig_doc_comments(source: &str, module_path: &str, version: &str) -> Vec<DocEntry> {
@@ -655,10 +698,11 @@ fn parse_zig_doc_comments(source: &str, module_path: &str, version: &str) -> Vec
                 if !name.is_empty() {
                     let doc_text = doc_lines.join("\n");
                     let title = format!("{}.{}", module_path, name);
+                    let declaration = collect_declaration(&lines, i);
                     let body = if doc_text.is_empty() {
-                        line.to_string()
+                        declaration
                     } else {
-                        format!("{}\n\n{}", doc_text, line)
+                        format!("{}\n\n{}", doc_text, declaration)
                     };
 
                     entries.push(DocEntry {
@@ -732,6 +776,275 @@ fn collect_struct_fields(lines: &[&str]) -> Vec<String> {
         }
     }
     fields
+}
+
+/// Collect the full declaration starting at `start`, potentially spanning multiple lines.
+fn collect_declaration(lines: &[&str], start: usize) -> String {
+    let line = lines[start].trim();
+    let rest = line.strip_prefix("pub ").unwrap_or(line);
+
+    // Multi-line function signature: collect until '{' or ';'
+    let is_fn = rest.starts_with("fn ")
+        || rest.starts_with("inline fn ")
+        || rest.starts_with("noinline fn ")
+        || rest.starts_with("export fn ")
+        || (rest.starts_with("extern ") && rest.contains(" fn "));
+
+    if is_fn && !line.contains('{') && !line.contains(';') {
+        let mut parts = vec![line.to_string()];
+        for j in (start + 1)..lines.len() {
+            let next = lines[j].trim();
+            if next.is_empty() {
+                break;
+            }
+            if let Some(pos) = next.find('{') {
+                let before = next[..pos].trim();
+                if !before.is_empty() {
+                    parts.push(before.to_string());
+                }
+                break;
+            }
+            if next.ends_with(';') {
+                parts.push(next.to_string());
+                break;
+            }
+            parts.push(next.to_string());
+        }
+        return parts.join(" ");
+    }
+
+    // Inline struct/enum/union: summarize fields and pub declarations
+    if line.contains("= struct {")
+        || line.contains("= enum {")
+        || line.contains("= enum(")
+        || line.contains("= union(")
+        || line.contains("= union {")
+    {
+        let mut depth: i32 = line.chars().filter(|&c| c == '{').count() as i32
+            - line.chars().filter(|&c| c == '}').count() as i32;
+
+        if depth <= 0 {
+            return line.to_string();
+        }
+
+        let mut fields = Vec::new();
+        let mut decls = Vec::new();
+        let cap = 30;
+        let mut j = start + 1;
+
+        while j < lines.len() && depth > 0 {
+            let next = lines[j].trim();
+            let prev_depth = depth;
+
+            depth += next.chars().filter(|&c| c == '{').count() as i32;
+            depth -= next.chars().filter(|&c| c == '}').count() as i32;
+
+            if depth <= 0 {
+                break;
+            }
+
+            if prev_depth == 1 && fields.len() + decls.len() < cap {
+                if next.starts_with("pub ") {
+                    let name = extract_decl_name(next);
+                    if !name.is_empty() {
+                        let kind = if next.contains(" fn ") {
+                            "fn"
+                        } else if next.contains(" const ") {
+                            "const"
+                        } else if next.contains(" var ") {
+                            "var"
+                        } else {
+                            ""
+                        };
+                        if kind.is_empty() {
+                            decls.push(format!("    pub {}", name));
+                        } else {
+                            decls.push(format!("    pub {} {}", kind, name));
+                        }
+                    }
+                } else if !next.is_empty()
+                    && !next.starts_with("//")
+                    && !next.starts_with('}')
+                    && !next.starts_with('{')
+                    && !next.starts_with("comptime")
+                {
+                    let first_char = next.chars().next().unwrap_or(' ');
+                    if (first_char.is_alphabetic() || first_char == '_') && next.contains(": ") {
+                        fields.push(format!("    {}", next.trim_end_matches(',')));
+                    }
+                }
+            }
+
+            j += 1;
+        }
+
+        if fields.is_empty() && decls.is_empty() {
+            return line.to_string();
+        }
+
+        let mut result = vec![line.to_string()];
+        result.extend(fields);
+        result.extend(decls);
+        result.push("}".to_string());
+        return result.join("\n");
+    }
+
+    line.to_string()
+}
+
+/// Extract a specific declaration from source code by dotted name path.
+/// E.g., "init" extracts `pub fn init`, "InitOptions.timeout" drills into
+/// the InitOptions struct and extracts the timeout field.
+fn extract_declaration(source: &str, path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let lines: Vec<&str> = source.lines().collect();
+    extract_decl_from_lines(&lines, &parts)
+}
+
+fn extract_decl_from_lines(lines: &[&str], path: &[&str]) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let name = path[0];
+    let mut brace_depth: i32 = 0;
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        let depth_before = brace_depth;
+
+        // Track brace depth so we only match declarations at the current scope
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+
+        if depth_before == 0 && decl_matches(trimmed, name) {
+            // Include preceding /// doc comments
+            let mut doc_start = i;
+            while doc_start > 0 && lines[doc_start - 1].trim().starts_with("///") {
+                doc_start -= 1;
+            }
+
+            let decl_end = find_decl_end(lines, i);
+
+            if path.len() == 1 {
+                return Some(dedent(&lines[doc_start..=decl_end].join("\n")));
+            } else {
+                // For nested lookup, extract the body between braces and recurse
+                let brace_line = (i..=decl_end).find(|&j| lines[j].contains('{'))?;
+                let body = &lines[brace_line + 1..decl_end];
+                return extract_decl_from_lines(body, &path[1..]);
+            }
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+/// Check if a source line declares the given name.
+fn decl_matches(line: &str, name: &str) -> bool {
+    let rest = line.strip_prefix("pub ").unwrap_or(line);
+
+    // Look for fn/const/var keyword and check the identifier after it
+    for kw in ["fn ", "const ", "var "] {
+        if let Some(pos) = rest.find(kw) {
+            let before = rest[..pos].trim();
+            if before.is_empty()
+                || before == "inline"
+                || before == "noinline"
+                || before == "export"
+                || before.starts_with("extern")
+            {
+                let after_kw = &rest[pos + kw.len()..];
+                let ident: String = after_kw
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '@')
+                    .collect();
+                if ident == name {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Field declarations: `name: Type` or `name: Type,`
+    let first_char = name.chars().next().unwrap_or(' ');
+    if (first_char.is_alphabetic() || first_char == '_')
+        && rest.starts_with(name)
+        && rest[name.len()..].starts_with(':')
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Find the end line of a declaration starting at `start`, tracking delimiter depth.
+fn find_decl_end(lines: &[&str], start: usize) -> usize {
+    let mut brace_depth: i32 = 0;
+    let mut paren_depth: i32 = 0;
+    let mut has_braces = false;
+
+    for j in start..lines.len() {
+        for ch in lines[j].chars() {
+            match ch {
+                '{' => {
+                    brace_depth += 1;
+                    has_braces = true;
+                }
+                '}' => brace_depth -= 1,
+                '(' => paren_depth += 1,
+                ')' => paren_depth -= 1,
+                _ => {}
+            }
+        }
+
+        if has_braces && brace_depth <= 0 {
+            return j;
+        }
+
+        if !has_braces && paren_depth <= 0 {
+            let trimmed = lines[j].trim();
+            if trimmed.ends_with(';') || trimmed.ends_with(',') {
+                return j;
+            }
+        }
+    }
+
+    lines.len().saturating_sub(1)
+}
+
+/// Remove common leading indentation from a block of text.
+fn dedent(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let min_indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    if min_indent == 0 {
+        return text.to_string();
+    }
+
+    lines
+        .iter()
+        .map(|l| {
+            if l.len() >= min_indent {
+                &l[min_indent..]
+            } else {
+                l.trim()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // --- Guide parsing ---

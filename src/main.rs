@@ -37,6 +37,15 @@ struct ListChildrenParams {
     version: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetSourceParams {
+    /// Module path to a stdlib symbol (e.g., "std.Io.Threaded" or "std.mem").
+    /// If the path points to a member within a module, returns the containing file.
+    path: String,
+    /// Zig version (default: "master")
+    version: Option<String>,
+}
+
 #[derive(Clone)]
 struct ZigDocsServer {
     doc_index: Arc<docs::DocIndex>,
@@ -218,6 +227,46 @@ impl ZigDocsServer {
             }
         }
     }
+
+    #[tool(
+        description = "Get the raw source code of a Zig standard library module. Use when parsed documentation is insufficient and you need to see the actual implementation. Only covers stdlib (.zig files from the standard library sources)."
+    )]
+    async fn get_source(
+        &self,
+        Parameters(params): Parameters<GetSourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let version = params.version.as_deref().unwrap_or("master");
+
+        match self.doc_index.get_source(&params.path, version).await {
+            Ok(Some((module_path, source))) => {
+                let header = if module_path != params.path {
+                    format!(
+                        "# Source: {} (containing module for {})\n\n",
+                        module_path, params.path
+                    )
+                } else {
+                    format!("# Source: {}\n\n", module_path)
+                };
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{}```zig\n{}\n```",
+                    header, source
+                ))]))
+            }
+            Ok(None) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "No source found for \"{}\".\n\n\
+                 This tool only covers the Zig standard library. \
+                 Use search_zig_docs to find the correct module path.",
+                params.path
+            ))])),
+            Err(e) => {
+                tracing::error!("get_source failed: {}", e);
+                Err(McpError::internal_error(
+                    format!("get_source failed: {}", e),
+                    None,
+                ))
+            }
+        }
+    }
 }
 
 #[tool_handler]
@@ -230,7 +279,8 @@ impl ServerHandler for ZigDocsServer {
                     "Search and browse Zig documentation: language reference, standard library, and learning guides.",
                     "Use search_zig_docs to find symbols by keyword. \
                      Use get_doc to read the full documentation for a specific symbol. \
-                     Use list_children to browse what's inside a module or type.",
+                     Use list_children to browse what's inside a module or type. \
+                     Use get_source to read the raw source code of a stdlib module when parsed docs are insufficient.",
                     include_str!("zig.md"),
                 )
                     .into(),
