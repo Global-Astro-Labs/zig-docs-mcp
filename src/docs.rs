@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use tantivy::collector::{Count, TopDocs};
@@ -42,9 +43,12 @@ pub struct ChildEntry {
     pub child_count: usize,
 }
 
+const VOLATILE_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 struct VersionIndex {
     tantivy: Index,
     entries: Vec<DocEntry>,
+    built_at: Instant,
 }
 
 pub struct DocIndex {
@@ -264,8 +268,11 @@ impl DocIndex {
     async fn ensure_index(&self, version: &str) -> Result<()> {
         {
             let indexes = self.indexes.lock().await;
-            if indexes.contains_key(version) {
-                return Ok(());
+            if let Some(vi) = indexes.get(version) {
+                if is_release_version(version) || vi.built_at.elapsed() < VOLATILE_CACHE_TTL {
+                    return Ok(());
+                }
+                tracing::info!("In-memory index expired for version {}", version);
             }
         }
 
@@ -334,6 +341,7 @@ impl DocIndex {
         Ok(VersionIndex {
             tantivy: index,
             entries: all_entries,
+            built_at: Instant::now(),
         })
     }
 
@@ -353,7 +361,7 @@ impl DocIndex {
         version: &str,
     ) -> Result<Vec<DocEntry>> {
         let tar_path = self.cache_dir.join(version).join("sources.tar");
-        let tar_bytes = if tar_path.exists() {
+        let tar_bytes = if tar_path.exists() && (is_release_version(version) || is_cache_fresh(&tar_path)) {
             tokio::fs::read(&tar_path).await?
         } else {
             let url = format!(
@@ -403,7 +411,7 @@ impl DocIndex {
     ) -> Result<String> {
         let path = self.cache_dir.join(version).join(filename);
 
-        if path.exists() {
+        if path.exists() && (is_release_version(version) || is_cache_fresh(&path)) {
             tracing::info!("Using cached {}", path.display());
             return Ok(tokio::fs::read_to_string(&path).await?);
         }
@@ -433,6 +441,18 @@ fn first_line(text: &str) -> String {
     } else {
         line.to_string()
     }
+}
+
+fn is_release_version(version: &str) -> bool {
+    version.chars().next().map_or(false, |c| c.is_ascii_digit())
+}
+
+fn is_cache_fresh(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    let Ok(modified) = meta.modified() else { return false };
+    SystemTime::now()
+        .duration_since(modified)
+        .map_or(false, |age| age < VOLATILE_CACHE_TTL)
 }
 
 // --- Langref parsing ---

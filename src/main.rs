@@ -14,7 +14,7 @@ use rmcp::{
 struct SearchParams {
     /// Search terms
     query: String,
-    /// Zig version (default: "0.15.2"). Applies to langref and stdlib; guides are unversioned.
+    /// Zig version (default: "master"). Applies to langref and stdlib; guides are unversioned.
     #[schemars(rename = "version")]
     version: Option<String>,
     /// Filter results by source: "langref", "stdlib", or "guide". Omit to search all sources.
@@ -25,7 +25,7 @@ struct SearchParams {
 struct GetDocParams {
     /// Full path to the symbol (e.g., "std.Io.Writer" or "std.mem.Allocator")
     path: String,
-    /// Zig version (default: "0.15.2")
+    /// Zig version (default: "master")
     version: Option<String>,
 }
 
@@ -33,7 +33,7 @@ struct GetDocParams {
 struct ListChildrenParams {
     /// Parent path to list children of (e.g., "std.Io" or "std.mem")
     parent: String,
-    /// Zig version (default: "0.15.2")
+    /// Zig version (default: "master")
     version: Option<String>,
 }
 
@@ -52,12 +52,14 @@ impl ZigDocsServer {
         }
     }
 
-    #[tool(description = "Search Zig programming language documentation. Covers the language reference, standard library API docs, and learning guides. Returns the top 10 results ranked by relevance.")]
+    #[tool(
+        description = "Search Zig programming language documentation. Covers the language reference, standard library API docs, and learning guides. Returns the top 10 results ranked by relevance."
+    )]
     async fn search_zig_docs(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let version = params.version.as_deref().unwrap_or("0.15.2");
+        let version = params.version.as_deref().unwrap_or("master");
 
         if let Some(ref source) = params.source {
             if !["langref", "stdlib", "guide"].contains(&source.as_str()) {
@@ -113,12 +115,14 @@ impl ZigDocsServer {
         }
     }
 
-    #[tool(description = "Get the full documentation for a specific Zig symbol by its path. Use after finding a symbol via search to read its complete documentation including doc comments and declaration.")]
+    #[tool(
+        description = "Get the full documentation for a specific Zig symbol by its path. Use after finding a symbol via search to read its complete documentation including doc comments and declaration."
+    )]
     async fn get_doc(
         &self,
         Parameters(params): Parameters<GetDocParams>,
     ) -> Result<CallToolResult, McpError> {
-        let version = params.version.as_deref().unwrap_or("0.15.2");
+        let version = params.version.as_deref().unwrap_or("master");
 
         match self.doc_index.get_doc(&params.path, version).await {
             Ok(results) => {
@@ -154,18 +158,16 @@ impl ZigDocsServer {
         }
     }
 
-    #[tool(description = "List the direct children (members, methods, types) of a Zig module or type. Shows each child with a summary and how many sub-children it has, so you know where to drill deeper. Use get_doc on a child for full details.")]
+    #[tool(
+        description = "List the direct children (members, methods, types) of a Zig module or type. Shows each child with a summary and how many sub-children it has, so you know where to drill deeper. Use get_doc on a child for full details."
+    )]
     async fn list_children(
         &self,
         Parameters(params): Parameters<ListChildrenParams>,
     ) -> Result<CallToolResult, McpError> {
-        let version = params.version.as_deref().unwrap_or("0.15.2");
+        let version = params.version.as_deref().unwrap_or("master");
 
-        match self
-            .doc_index
-            .list_children(&params.parent, version)
-            .await
-        {
+        match self.doc_index.list_children(&params.parent, version).await {
             Ok(children) => {
                 if children.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -195,7 +197,8 @@ impl ZigDocsServer {
                             format!(" — {}", c.summary)
                         };
                         format!(
-                            "- **{}** [{}]{}{}", c.name, c.source, children_note, summary
+                            "- **{}** [{}]{}{}",
+                            c.name, c.source, children_note, summary
                         )
                     })
                     .collect();
@@ -251,12 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting Zig Docs MCP server");
 
-    let service = ZigDocsServer::new()
-        .serve(stdio())
-        .await
-        .inspect_err(|e| {
-            tracing::error!("Failed to start server: {}", e);
-        })?;
+    let service = ZigDocsServer::new().serve(stdio()).await.inspect_err(|e| {
+        tracing::error!("Failed to start server: {}", e);
+    })?;
 
     service.waiting().await?;
     Ok(())
